@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/MobilityData/gtfs-realtime-validator/gtfs-realtime-validator-api/schema/validation-response.schema.json",
+  "title": "ValidationResponse",
+  "description": "Response body returned by POST /api/validate.",
+  "type": "object",
+  "required": ["gtfsUrl", "currentTimeMillis", "feeds"],
+  "additionalProperties": false,
+  "properties": {
+    "gtfsUrl": {
+      "type": "string",
+      "format": "uri",
+      "description": "The GTFS zip URL that was validated, echoed from the request."
+    },
+    "currentTimeMillis": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Server-side wall-clock time (milliseconds since the Unix epoch) at the moment validation ran. Shared by all feeds in the response."
+    },
+    "feeds": {
+      "type": "array",
+      "description": "One entry per URL in the request's gtfsRtUrls, in the same order.",
+      "items": { "$ref": "#/$defs/FeedValidationResult" }
+    }
+  },
+  "$defs": {
+    "FeedValidationResult": {
+      "type": "object",
+      "required": ["gtfsRtUrl", "feedTimestampSeconds", "results", "skippedRules"],
+      "additionalProperties": false,
+      "properties": {
+        "gtfsRtUrl": {
+          "type": "string",
+          "format": "uri",
+          "description": "The GTFS-realtime URL this result corresponds to."
+        },
+        "feedTimestampSeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The feed header.timestamp value (seconds since the Unix epoch). 0 when the protobuf has no header."
+        },
+        "results": {
+          "type": "array",
+          "description": "One entry per validation rule that produced one or more findings against this feed.",
+          "items": { "$ref": "#/$defs/ValidationError" }
+        },
+        "skippedRules": {
+          "type": "array",
+          "description": "Rules that threw an exception while evaluating this feed. Their findings are not included in results.",
+          "items": { "$ref": "#/$defs/SkippedRule" }
+        }
+      }
+    },
+    "ValidationError": {
+      "type": "object",
+      "required": ["errorId", "severity", "title", "description", "suffix", "errorDetails", "occurrences"],
+      "additionalProperties": false,
+      "properties": {
+        "errorId": {
+          "type": "string",
+          "description": "Stable identifier for the rule (e.g. 'W001', 'E002'). See RULES.md."
+        },
+        "severity": {
+          "type": "string",
+          "enum": ["WARNING", "ERROR"]
+        },
+        "title": {
+          "type": "string",
+          "description": "Short human-readable title for the rule."
+        },
+        "description": {
+          "type": "string",
+          "description": "Longer human-readable description of what the rule checks."
+        },
+        "suffix": {
+          "type": "string",
+          "description": "Sentence fragment appended to each occurrence's prefix to form the full message. Example: 'does not have a timestamp'."
+        },
+        "errorDetails": {
+          "type": ["string", "null"],
+          "description": "Optional rule-specific details. Usually null."
+        },
+        "occurrences": {
+          "type": "array",
+          "description": "Per-entity prefixes, e.g. 'trip_id 277716'. Build the full message as `prefix + \" \" + suffix`.",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "SkippedRule": {
+      "type": "object",
+      "required": ["name", "exceptionClass", "message"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Simple class name of the validator that threw, e.g. 'TimestampValidator'."
+        },
+        "exceptionClass": {
+          "type": "string",
+          "description": "Fully qualified class name of the thrown exception."
+        },
+        "message": {
+          "type": ["string", "null"],
+          "description": "Exception message; may be null if the thrown exception had none."
+        }
+      }
+    }
+  }
+}
