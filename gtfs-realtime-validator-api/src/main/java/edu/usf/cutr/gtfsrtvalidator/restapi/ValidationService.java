@@ -34,6 +34,12 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.TimeZone;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 public class ValidationService {
 
@@ -41,6 +47,7 @@ public class ValidationService {
 
     private static final int CONNECT_TIMEOUT_MS = 30_000;
     private static final int READ_TIMEOUT_MS = 60_000;
+    private static final int MAX_PARALLEL_FETCHES = 8;
 
     private final List<FeedEntityValidator> validators;
 
@@ -58,9 +65,14 @@ public class ValidationService {
         );
     }
 
-    public ValidationResponse validate(String gtfsUrl, String gtfsRtUrl) throws ValidationException {
+    public ValidationResponse validate(String gtfsUrl, List<String> gtfsRtUrls) throws ValidationException {
         requireHttpUrl(gtfsUrl, "gtfsUrl");
-        requireHttpUrl(gtfsRtUrl, "gtfsRtUrl");
+        if (gtfsRtUrls == null || gtfsRtUrls.isEmpty()) {
+            throw new ValidationException(HttpStatus.BAD_REQUEST, "gtfsRtUrls must contain at least one URL");
+        }
+        for (int i = 0; i < gtfsRtUrls.size(); i++) {
+            requireHttpUrl(gtfsRtUrls.get(i), "gtfsRtUrls[" + i + "]");
+        }
 
         Path gtfsTempFile = null;
         try {
@@ -88,36 +100,19 @@ public class ValidationService {
                     false
             );
 
-            byte[] gtfsRtBytes = downloadBytes(gtfsRtUrl);
-            GtfsRealtime.FeedMessage feedMessage;
-            try {
-                feedMessage = GtfsRealtime.FeedMessage.parseFrom(gtfsRtBytes);
-            } catch (IOException e) {
-                throw new ValidationException(HttpStatus.UNPROCESSABLE_CONTENT, "Failed to parse GTFS-realtime protobuf: " + e.getMessage(), e);
-            }
-
-            GtfsRealtime.FeedMessage combinedFeed = GtfsUtils.isCombinedFeed(feedMessage) ? feedMessage : null;
+            List<GtfsRealtime.FeedMessage> feedMessages = fetchAndParseFeeds(gtfsRtUrls);
+            GtfsRealtime.FeedMessage combinedFeed = buildCombinedFeed(feedMessages);
 
             long currentTimeMillis = System.currentTimeMillis();
-            long feedTimestampSeconds = feedMessage.hasHeader() ? feedMessage.getHeader().getTimestamp() : 0L;
 
-            List<ValidationError> results = new ArrayList<>();
-            List<SkippedRule> skippedRules = new ArrayList<>();
-            for (FeedEntityValidator rule : validators) {
-                String name = rule.getClass().getSimpleName();
-                try {
-                    List<ErrorListHelperModel> ruleResults = rule.validate(
-                            currentTimeMillis, gtfsData, gtfsMetadata, feedMessage, null, combinedFeed);
-                    if (ruleResults != null) {
-                        ruleResults.stream().map(ValidationError::from).forEach(results::add);
-                    }
-                } catch (Exception e) {
-                    skippedRules.add(new SkippedRule(name, e.getClass().getName(), e.getMessage()));
-                    log.error("Rule {} threw {}", name, e.getClass().getSimpleName(), e);
-                }
+            List<FeedValidationResult> feedResults = new ArrayList<>(feedMessages.size());
+            for (int i = 0; i < feedMessages.size(); i++) {
+                feedResults.add(validateFeed(
+                        gtfsRtUrls.get(i), feedMessages.get(i), combinedFeed,
+                        currentTimeMillis, gtfsData, gtfsMetadata));
             }
 
-            return new ValidationResponse(gtfsUrl, gtfsRtUrl, currentTimeMillis, feedTimestampSeconds, results, skippedRules);
+            return new ValidationResponse(gtfsUrl, currentTimeMillis, feedResults);
         } finally {
             if (gtfsTempFile != null) {
                 try {
@@ -127,6 +122,107 @@ public class ValidationService {
                 }
             }
         }
+    }
+
+    private FeedValidationResult validateFeed(String gtfsRtUrl, GtfsRealtime.FeedMessage feedMessage,
+                                              GtfsRealtime.FeedMessage combinedFeed, long currentTimeMillis,
+                                              GtfsDaoImpl gtfsData, GtfsMetadata gtfsMetadata) {
+        long feedTimestampSeconds = feedMessage.hasHeader() ? feedMessage.getHeader().getTimestamp() : 0L;
+        List<ValidationError> results = new ArrayList<>();
+        List<SkippedRule> skippedRules = new ArrayList<>();
+        for (FeedEntityValidator rule : validators) {
+            String name = rule.getClass().getSimpleName();
+            try {
+                List<ErrorListHelperModel> ruleResults = rule.validate(
+                        currentTimeMillis, gtfsData, gtfsMetadata, feedMessage, null, combinedFeed);
+                if (ruleResults != null) {
+                    ruleResults.stream().map(ValidationError::from).forEach(results::add);
+                }
+            } catch (Exception e) {
+                skippedRules.add(new SkippedRule(name, e.getClass().getName(), e.getMessage()));
+                log.error("Rule {} threw {} on {}", name, e.getClass().getSimpleName(), gtfsRtUrl, e);
+            }
+        }
+        return new FeedValidationResult(gtfsRtUrl, feedTimestampSeconds, results, skippedRules);
+    }
+
+    /**
+     * Returns the merged feed when the validator should perform cross-feed checks: either a single
+     * URL that already mixes entity types, or multiple URLs that collectively do. Otherwise null.
+     * Mirrors the logic in {@code BackgroundTask.run()}.
+     */
+    private static GtfsRealtime.FeedMessage buildCombinedFeed(List<GtfsRealtime.FeedMessage> feeds) {
+        if (feeds.size() == 1) {
+            GtfsRealtime.FeedMessage only = feeds.get(0);
+            return GtfsUtils.isCombinedFeed(only) ? only : null;
+        }
+        GtfsRealtime.FeedHeader header = null;
+        List<GtfsRealtime.FeedEntity> allEntities = new ArrayList<>();
+        for (GtfsRealtime.FeedMessage msg : feeds) {
+            if (msg.hasHeader() && (header == null || msg.getHeader().getTimestamp() > header.getTimestamp())) {
+                header = msg.getHeader();
+            }
+            allEntities.addAll(msg.getEntityList());
+        }
+        GtfsRealtime.FeedMessage.Builder builder = GtfsRealtime.FeedMessage.newBuilder();
+        if (header != null) {
+            builder.setHeader(header);
+        }
+        builder.addAllEntity(allEntities);
+        return builder.build();
+    }
+
+    private List<GtfsRealtime.FeedMessage> fetchAndParseFeeds(List<String> urls) throws ValidationException {
+        int parallelism = Math.min(urls.size(), MAX_PARALLEL_FETCHES);
+        ExecutorService pool = Executors.newFixedThreadPool(parallelism, r -> {
+            Thread t = new Thread(r, "gtfsrt-fetch");
+            t.setDaemon(true);
+            return t;
+        });
+        try {
+            List<Future<GtfsRealtime.FeedMessage>> futures = new ArrayList<>(urls.size());
+            for (String url : urls) {
+                futures.add(pool.submit(fetchAndParseTask(url)));
+            }
+            List<GtfsRealtime.FeedMessage> messages = new ArrayList<>(urls.size());
+            for (Future<GtfsRealtime.FeedMessage> f : futures) {
+                try {
+                    messages.add(f.get());
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new ValidationException(HttpStatus.INTERNAL_SERVER_ERROR, "Interrupted while fetching feeds", e);
+                } catch (ExecutionException e) {
+                    Throwable cause = e.getCause();
+                    if (cause instanceof ValidationException) {
+                        throw (ValidationException) cause;
+                    }
+                    throw new ValidationException(HttpStatus.INTERNAL_SERVER_ERROR, "Feed fetch failed: " + cause.getMessage(), cause);
+                }
+            }
+            return messages;
+        } finally {
+            pool.shutdown();
+            try {
+                if (!pool.awaitTermination(5, TimeUnit.SECONDS)) {
+                    pool.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                pool.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    private static Callable<GtfsRealtime.FeedMessage> fetchAndParseTask(String url) {
+        return () -> {
+            byte[] bytes = downloadBytes(url);
+            try {
+                return GtfsRealtime.FeedMessage.parseFrom(bytes);
+            } catch (IOException e) {
+                throw new ValidationException(HttpStatus.UNPROCESSABLE_CONTENT,
+                        "Failed to parse GTFS-realtime protobuf from " + url + ": " + e.getMessage(), e);
+            }
+        };
     }
 
     private static void requireHttpUrl(String value, String field) throws ValidationException {
@@ -155,7 +251,6 @@ public class ValidationService {
         } catch (IOException e) {
             throw new ValidationException(HttpStatus.INTERNAL_SERVER_ERROR, "Could not create temp file: " + e.getMessage(), e);
         }
-        // Best-effort cleanup if the JVM exits before the finally block runs.
         file.toFile().deleteOnExit();
         try {
             withConnection(url, in -> {

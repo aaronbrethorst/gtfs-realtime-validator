@@ -125,36 +125,45 @@ Request body:
 ```
 {
   "gtfsUrl": "https://example.com/google_transit.zip",
-  "gtfsRtUrl": "https://example.com/realtime/TripUpdates.pb"
+  "gtfsRtUrls": [
+    "https://example.com/realtime/TripUpdates.pb",
+    "https://example.com/realtime/VehiclePositions.pb"
+  ]
 }
 ```
 
-The server downloads both URLs, parses the GTFS zip and the GTFS-realtime protobuf, runs the same validation rules used by [batch processing](gtfs-realtime-validator-lib/README.md#batch-processing) and the webapp, and returns:
+`gtfsRtUrls` is an array; pass one URL or several. Multiple URLs are fetched in parallel and treated as belonging to the same GTFS dataset, so cross-feed rules (e.g. `CrossFeedDescriptorValidator`) see entities from all of them.
+
+The server downloads the GTFS zip and each GTFS-realtime protobuf, parses them, runs the same validation rules used by [batch processing](gtfs-realtime-validator-lib/README.md#batch-processing) and the webapp, and returns:
 
 ```
 {
   "gtfsUrl": "...",
-  "gtfsRtUrl": "...",
   "currentTimeMillis": 1714492800000,
-  "feedTimestampSeconds": 1714492790,
-  "results": [
+  "feeds": [
     {
-      "errorId": "W001",
-      "severity": "WARNING",
-      "title": "timestamp not populated",
-      "description": "Timestamps should be populated for all elements",
-      "suffix": "does not have a timestamp",
-      "errorDetails": null,
-      "occurrences": ["trip_id 277716", "trip_id 277767"]
+      "gtfsRtUrl": "https://example.com/realtime/TripUpdates.pb",
+      "feedTimestampSeconds": 1714492790,
+      "results": [
+        {
+          "errorId": "W001",
+          "severity": "WARNING",
+          "title": "timestamp not populated",
+          "description": "Timestamps should be populated for all elements",
+          "suffix": "does not have a timestamp",
+          "errorDetails": null,
+          "occurrences": ["trip_id 277716", "trip_id 277767"]
+        }
+      ],
+      "skippedRules": []
     }
-  ],
-  "skippedRules": []
+  ]
 }
 ```
 
-The full message for each occurrence is `prefix + " " + suffix` — for example, `trip_id 277716 does not have a timestamp`. See [RULES.md](RULES.md) for the full list of `errorId`s.
+Each entry in `feeds` corresponds to one entry in the request's `gtfsRtUrls`, in the same order. The full message for each occurrence is `prefix + " " + suffix` — for example, `trip_id 277716 does not have a timestamp`. See [RULES.md](RULES.md) for the full list of `errorId`s.
 
-If a single rule throws during evaluation, the request still returns 200 with the rule recorded under `skippedRules` (with the rule name, exception class, and message); the rest of the rules continue to evaluate.
+If a single rule throws during evaluation of a feed, the request still returns 200 with the rule recorded under that feed's `skippedRules` (with the rule name, exception class, and message); the remaining rules continue to evaluate. Cross-feed rule errors will appear in each feed's `results` (the lib runs all rules per feed message); de-duplicate client-side by `errorId` if needed.
 
 ### Status codes
 
@@ -162,7 +171,7 @@ If a single rule throws during evaluation, the request still returns 200 with th
 |-------:|------------------------------------------------------------------------|
 | `200`  | Validation completed (may include non-empty `skippedRules`)            |
 | `400`  | Missing field, non-`http`/`https` scheme, missing host, malformed URL  |
-| `422`  | Unparseable GTFS zip, unparseable GTFS-rt protobuf, no agency timezone |
+| `422`  | Unparseable GTFS zip, unparseable GTFS-rt protobuf (any of `gtfsRtUrls`), no agency timezone |
 | `502`  | Upstream fetch failure                                                 |
 | `500`  | Anything else (logged server-side; generic message returned)           |
 
@@ -180,7 +189,10 @@ curl -X POST http://localhost:8090/api/validate \
   -H "Content-Type: application/json" \
   -d '{
     "gtfsUrl": "https://cdn.mbta.com/MBTA_GTFS.zip",
-    "gtfsRtUrl": "https://cdn.mbta.com/realtime/TripUpdates.pb"
+    "gtfsRtUrls": [
+      "https://cdn.mbta.com/realtime/TripUpdates.pb",
+      "https://cdn.mbta.com/realtime/VehiclePositions.pb"
+    ]
   }'
 ```
 

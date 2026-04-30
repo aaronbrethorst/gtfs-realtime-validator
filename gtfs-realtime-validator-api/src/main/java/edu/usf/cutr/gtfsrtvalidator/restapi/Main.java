@@ -39,7 +39,7 @@ public class Main {
         app.post("/api/validate", ctx -> {
             ValidateRequest req = ctx.bodyAsClass(ValidateRequest.class);
             try {
-                ValidationResponse response = service.validate(req.gtfsUrl, req.gtfsRtUrl);
+                ValidationResponse response = service.validate(req.gtfsUrl, req.gtfsRtUrls);
                 ctx.json(response);
             } catch (ValidationException e) {
                 ctx.status(e.getStatus()).json(Map.of("error", e.getMessage()));
@@ -83,6 +83,6 @@ public class Main {
 
     public static class ValidateRequest {
         public String gtfsUrl;
-        public String gtfsRtUrl;
+        public List<String> gtfsRtUrls;
     }
 }
