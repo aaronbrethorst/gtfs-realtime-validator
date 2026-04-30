@@ -196,6 +196,32 @@ curl -X POST http://localhost:8090/api/validate \
   }'
 ```
 
+### Docker
+
+A multi-stage Dockerfile is provided at `gtfs-realtime-validator-api/Dockerfile`. It compiles only the `gtfs-realtime-validator-lib` and `gtfs-realtime-validator-api` modules (the webapp module is skipped) and produces a runtime image based on `eclipse-temurin:21-jre-alpine`.
+
+Build (run from the repo root so the build context includes the multi-module Maven project):
+
+```
+docker build -f gtfs-realtime-validator-api/Dockerfile -t gtfs-realtime-validator-api:latest .
+```
+
+Run:
+
+```
+docker run --rm -p 8090:8090 gtfs-realtime-validator-api:latest
+```
+
+The image exposes port 8090, includes a `HEALTHCHECK` that polls `GET /health`, and honors the same `PORT` and `CORS_ALLOWED_ORIGINS` environment variables as the standalone jar:
+
+```
+docker run --rm \
+  -e PORT=9000 \
+  -e CORS_ALLOWED_ORIGINS=https://example.com \
+  -p 9000:9000 \
+  gtfs-realtime-validator-api:latest
+```
+
 ### Notes and limitations
 
 * The validator's GTFS reader (`onebusaway-gtfs` 1.3.87) does not recognize some newer optional GTFS files such as `areas.txt`. Feeds that include those files currently return a `422`.
