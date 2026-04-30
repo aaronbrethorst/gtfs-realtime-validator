@@ -30,6 +30,10 @@ Questions? You can [open an issue](https://github.com/MobilityData/gtfs-realtime
     * ...more at [OpenMobilityData.org](https://openmobilitydata.org/search?q=gtfsrt)
 
 
+### Run the REST API
+
+A stateless one-shot validator that exposes `POST /api/validate` over HTTP. Intended as the backend for custom front-ends (e.g. a React UI) that don't need the multi-user iteration tracking of the webapp. See the [REST API](#rest-api) section below for endpoints, request/response shape, and configuration.
+
 ### Run batch validation
 
 See the [batch processing](gtfs-realtime-validator-lib/README.md#batch-processing) section of the [**gtfs-realtime-validator-lib** README](gtfs-realtime-validator-lib/README.md).
@@ -43,9 +47,10 @@ Have a suggestion for a new rule?  Open an issue with the ["new rule" label](htt
  
 ## Building the project 
 
-There are two components to this project:
+There are three components to this project:
 * **gtfs-realtime-validator-lib** - The core library that implements GTFS Realtime [validation rules](RULES.md) as well as [batch processing mode](gtfs-realtime-validator-lib/README.md#batch-processing).  You can use this same library [in your own project](gtfs-realtime-validator-lib/README.md#using-validation-rules-or-the-batch-processor-in-your-project).
-* **gtfs-realtime-validator-webapp** - A server and website that allows multiple users to validate GTFS-relatime feeds by simply entering URLs into the website.
+* **gtfs-realtime-validator-webapp** - A server and website that allows multiple users to validate GTFS-realtime feeds by simply entering URLs into the website.
+* **gtfs-realtime-validator-api** - A thin [Javalin](https://javalin.io/)-based HTTP server that wraps the library to expose stateless, one-shot validation as a JSON API. See the [REST API](#rest-api) section.
 
 The main **gtfs-realtime-validator-webapp** user interface is implemented as a web application, with the backend code written in Java.  An instance of the [Jetty embedded server](https://www.eclipse.org/jetty/) is used to run the application, with [Hibernate](https://hibernate.org/) used for data persistence.
 
@@ -62,7 +67,9 @@ From the command-line, run:
 
 `mvn package`
 
-This will generate an executable file in the `gtfs-realtime-validator-webapp/target/` directory with all the dependencies needed to run the web application.
+This will generate executable jars for both server modules:
+* `gtfs-realtime-validator-webapp/target/` - the multi-user web application (see below)
+* `gtfs-realtime-validator-api/target/` - the REST API server (see the [REST API](#rest-api) section)
 
 Note that this might take a while - this project also builds and packages the [gtfs-validator](https://github.com/conveyal/gtfs-validator) so a static GTFS validation report can be seen within the GTFS-rt validator tool.
  
@@ -89,6 +96,100 @@ See our [Configuration Guide](CONFIG.md) for various configuration options, incl
 
 Note that the validator also has a [batch processing mode](gtfs-realtime-validator-lib/README.md#batch-processing) - see the [**gtfs-realtime-validator-lib** README](gtfs-realtime-validator-lib/README.md).
  
+## REST API
+
+The **gtfs-realtime-validator-api** module is a thin [Javalin](https://javalin.io/)-based HTTP server that wraps the validation library to expose stateless, one-shot validation as a JSON API. It is intended as the backend for custom front-ends (e.g. a React UI) that don't need the multi-user iteration tracking of the **gtfs-realtime-validator-webapp**.
+
+Unlike the webapp it has no database, no background polling, and no session state — each `POST /api/validate` call fetches the supplied URLs, runs the validation rules once, and returns the results.
+
+### Run it
+
+After `mvn package`, run:
+
+```
+java -jar gtfs-realtime-validator-api/target/gtfs-realtime-validator-api-1.0.0-SNAPSHOT.jar
+```
+
+The server listens on `http://localhost:8090` by default. Hit `GET /health` to confirm it's up.
+
+### Endpoints
+
+#### `GET /health`
+
+Returns `{"status":"ok"}` when the server is running.
+
+#### `POST /api/validate`
+
+Request body:
+
+```
+{
+  "gtfsUrl": "https://example.com/google_transit.zip",
+  "gtfsRtUrl": "https://example.com/realtime/TripUpdates.pb"
+}
+```
+
+The server downloads both URLs, parses the GTFS zip and the GTFS-realtime protobuf, runs the same validation rules used by [batch processing](gtfs-realtime-validator-lib/README.md#batch-processing) and the webapp, and returns:
+
+```
+{
+  "gtfsUrl": "...",
+  "gtfsRtUrl": "...",
+  "currentTimeMillis": 1714492800000,
+  "feedTimestampSeconds": 1714492790,
+  "results": [
+    {
+      "errorId": "W001",
+      "severity": "WARNING",
+      "title": "timestamp not populated",
+      "description": "Timestamps should be populated for all elements",
+      "suffix": "does not have a timestamp",
+      "errorDetails": null,
+      "occurrences": ["trip_id 277716", "trip_id 277767"]
+    }
+  ],
+  "skippedRules": []
+}
+```
+
+The full message for each occurrence is `prefix + " " + suffix` — for example, `trip_id 277716 does not have a timestamp`. See [RULES.md](RULES.md) for the full list of `errorId`s.
+
+If a single rule throws during evaluation, the request still returns 200 with the rule recorded under `skippedRules` (with the rule name, exception class, and message); the rest of the rules continue to evaluate.
+
+### Status codes
+
+| Status | Meaning                                                                |
+|-------:|------------------------------------------------------------------------|
+| `200`  | Validation completed (may include non-empty `skippedRules`)            |
+| `400`  | Missing field, non-`http`/`https` scheme, missing host, malformed URL  |
+| `422`  | Unparseable GTFS zip, unparseable GTFS-rt protobuf, no agency timezone |
+| `502`  | Upstream fetch failure                                                 |
+| `500`  | Anything else (logged server-side; generic message returned)           |
+
+### Configuration
+
+| Env var                | Default | Effect                                                    |
+|------------------------|---------|-----------------------------------------------------------|
+| `PORT`                 | `8090`  | Port to listen on                                         |
+| `CORS_ALLOWED_ORIGINS` | (unset) | Comma-separated list of allowed origins; unset → any host |
+
+### Example
+
+```
+curl -X POST http://localhost:8090/api/validate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "gtfsUrl": "https://cdn.mbta.com/MBTA_GTFS.zip",
+    "gtfsRtUrl": "https://cdn.mbta.com/realtime/TripUpdates.pb"
+  }'
+```
+
+### Notes and limitations
+
+* The validator's GTFS reader (`onebusaway-gtfs` 1.3.87) does not recognize some newer optional GTFS files such as `areas.txt`. Feeds that include those files currently return a `422`.
+* The server fetches arbitrary URLs supplied by the caller. Treat it as an internal service or place it behind an allow-list — there is currently no SSRF guard against private/loopback addresses, and no upper bound on download size.
+* CORS is wide open by default. Set `CORS_ALLOWED_ORIGINS` for any deployment beyond local development.
+
 ## Docker
 ### Setup
 1. Download and install [Docker](https://docs.docker.com/get-started/)
